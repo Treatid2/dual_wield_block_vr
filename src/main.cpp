@@ -42,14 +42,24 @@ float handForwardHmdRightUnarmedExit = 0.4;
 float hmdToHandDistanceUpUnarmedEnter = 0.35;
 float hmdToHandDistanceUpUnarmedExit = 0.35;
 
-bool isLastUpdateValid = false;
-
 const int numPrevIsBlocking = 5; // Should be an odd number
 bool prevIsBlockings[numPrevIsBlocking];  // previous n IsBlocking animation values
 
 const int blockCooldown = 30; // number of updates to ignore block start / stop
+const int blockStopConfirmFrames = 3; // ignore the one-frame IsBlocking drop that occurs when blocking a hit
+const int postLoadReconcileDelayFrames = 120; // allow actor and graph state to settle before direct repair
 int lastBlockStartFrameCount = 0; // number of updates we should still wait before attempting to start blocking
 int lastBlockStopFrameCount = 0; // number of updates we should still wait before attempting to stop blocking
+
+// State owned by this plugin. Animation events are asynchronous: accepting blockStop does not
+// guarantee that IsBlocking has already cleared, so keep retrying until the graph confirms it.
+bool pluginRequestedBlocking = false;
+bool blockStopPending = false;
+bool postLoadReconcilePending = false;
+int blockStopRetryCount = 0;
+int blockStopFalseFrameCount = 0;
+int postLoadReconcileDelayFrameCount = 0;
+int postLoadGraphFalseFrameCount = 0;
 
 
 TESForm * GetMainHandObject(Actor *actor)
@@ -99,12 +109,33 @@ bool IsBlockingInternal(Actor *actor)
 	return (actor->actorState.flags08 >> 8) & 1;
 }
 
+bool TryGetIsBlocking(Actor *actor, bool &isBlocking)
+{
+	isBlocking = false;
+	if (!actor) return false;
+
+	static BSFixedString s_IsBlocking("IsBlocking");
+	return get_vfunc<_IAnimationGraphManagerHolder_GetAnimationVariableBool>(&actor->animGraphHolder, 0x12)(
+		&actor->animGraphHolder, s_IsBlocking, isBlocking);
+}
+
+bool TrySetIsBlocking(Actor *actor, bool isBlocking)
+{
+	if (!actor) return false;
+
+	// CommonLibVR relocation ID 32141 for Skyrim VR 1.4.15.
+	static RelocAddr<_IAnimationGraphManagerHolder_SetGraphVariableBool> setGraphVariableBool(0x00500950);
+	static BSFixedString s_IsBlocking("IsBlocking");
+	return setGraphVariableBool(&actor->animGraphHolder, s_IsBlocking, isBlocking);
+}
+
 // Get the mode of the IsBlocking value over the last few frames. This is needed because when you block a hit, it goes to 0 for 1 frame, then back to 1.
-bool GetIsBlockingMode()
+// Returns false when the graph variable cannot be read; callers must not use an uninitialised value.
+bool GetIsBlockingMode(bool &isBlockingMode)
 {
 	PlayerCharacter *player = *g_thePlayer;
-	static BSFixedString s_IsBlocking("IsBlocking");
-	bool isBlocking; get_vfunc<_IAnimationGraphManagerHolder_GetAnimationVariableBool>(&player->animGraphHolder, 0x12)(&player->animGraphHolder, s_IsBlocking, isBlocking);
+	bool isBlocking = false;
+	if (!TryGetIsBlocking(player, isBlocking)) return false;
 
 	int numTrue = (int)isBlocking;
 	int numFalse = (int)(!isBlocking);
@@ -114,10 +145,11 @@ bool GetIsBlockingMode()
 		else numFalse++;
 	}
 	prevIsBlockings[0] = isBlocking;
-	return (numTrue >= numFalse);
+	isBlockingMode = (numTrue >= numFalse);
+	return true;
 }
 
-// Returns 2 if we should start blocking, 1 if we should stop blocking, 0 if no effect
+// Returns 2 while the hand is in the blocking pose, 1 if we should stop blocking, 0 if no effect.
 int GetHandBlockingStatus(NiTransform &hmdPose, NiTransform &handPose, float handSpeed, bool isBlocking)
 {
 	NiPoint3 hmdPosition = hmdPose.pos;
@@ -141,10 +173,7 @@ int GetHandBlockingStatus(NiTransform &hmdPose, NiTransform &handPose, float han
 		abs(handForwardDotWithHmdForward) <= handForwardHmdForwardEnter &&
 		abs(hmdToHandVerticalDistance) <= hmdToHandDistanceUpEnter) {
 
-		if (!isBlocking) {
-			// Start blocking
-			return 2;
-		}
+		return 2;
 	}
 	else if (handSpeed > maxSpeedExit ||
 		handForwardDotWithHmdDown < handForwardHmdDownExit ||
@@ -159,7 +188,7 @@ int GetHandBlockingStatus(NiTransform &hmdPose, NiTransform &handPose, float han
 	return 0;
 }
 
-// Returns 2 if we should start blocking, 1 if we should stop blocking, 0 if no effect
+// Returns 2 while the hand is in the blocking pose, 1 if we should stop blocking, 0 if no effect.
 int GetHandBlockingStatusUnarmed(NiTransform &hmdPose, NiTransform &handPose, float handSpeed, bool isBlocking, bool isLeft)
 {
 	NiPoint3 hmdPosition = hmdPose.pos;
@@ -182,10 +211,7 @@ int GetHandBlockingStatusUnarmed(NiTransform &hmdPose, NiTransform &handPose, fl
 		handForwardDotWithHmdOutwards >= handForwardHmdRightUnarmedEnter &&
 		abs(hmdToHandVerticalDistance) <= hmdToHandDistanceUpUnarmedEnter) {
 
-		if (!isBlocking) {
-			// Start blocking
-			return 2;
-		}
+		return 2;
 	}
 	else if (handSpeed > maxSpeedUnarmedExit ||
 		handForwardDotWithHmdOutwards < handForwardHmdRightUnarmedExit ||
@@ -242,18 +268,107 @@ void UpdateHandSpeeds(vr_src::TrackedDevicePose_t *pGamePoseArray, uint32_t unGa
 	}
 }
 
-void StartBlocking(Actor *actor)
+bool StartBlocking(Actor *actor)
 {
 	static BSFixedString s_blockStart("blockStart");
-	get_vfunc<_IAnimationGraphManagerHolder_NotifyAnimationGraph>(&actor->animGraphHolder, 0x1)(&actor->animGraphHolder, s_blockStart);
-	_MESSAGE("Start block");
+	const bool accepted = get_vfunc<_IAnimationGraphManagerHolder_NotifyAnimationGraph>(&actor->animGraphHolder, 0x1)(
+		&actor->animGraphHolder, s_blockStart);
+	_MESSAGE("Start block (accepted=%d)", accepted);
+
+	if (accepted) {
+		pluginRequestedBlocking = true;
+		blockStopPending = false;
+		blockStopRetryCount = 0;
+		blockStopFalseFrameCount = 0;
+	}
+	return accepted;
 }
 
-void StopBlocking(Actor *actor)
+bool StopBlocking(Actor *actor)
 {
 	static BSFixedString s_blockStop("blockStop");
-	get_vfunc<_IAnimationGraphManagerHolder_NotifyAnimationGraph>(&actor->animGraphHolder, 0x1)(&actor->animGraphHolder, s_blockStop);
-	_MESSAGE("Stop block");
+	const bool accepted = get_vfunc<_IAnimationGraphManagerHolder_NotifyAnimationGraph>(&actor->animGraphHolder, 0x1)(
+		&actor->animGraphHolder, s_blockStop);
+	_MESSAGE("Stop block (accepted=%d)", accepted);
+	return accepted;
+}
+
+void RequestStopBlocking()
+{
+	if (pluginRequestedBlocking) {
+		blockStopPending = true;
+	}
+}
+
+void CancelPendingStop()
+{
+	blockStopPending = false;
+	blockStopRetryCount = 0;
+	blockStopFalseFrameCount = 0;
+	lastBlockStopFrameCount = 0;
+}
+
+int GetBlockStopRetryCooldown()
+{
+	const int retryShift = blockStopRetryCount > 1 ?
+		(blockStopRetryCount - 1 < 3 ? blockStopRetryCount - 1 : 3) :
+		0;
+	return blockCooldown << retryShift;
+}
+
+void ProcessPendingStop(Actor *actor, bool graphReady, bool isBlocking)
+{
+	if (!blockStopPending || !pluginRequestedBlocking || !graphReady) return;
+
+	// Vanilla/shield blocking can take over after an equipment transition. Once the game
+	// requests blocking itself, this plugin no longer owns the shared graph state.
+	if (IsBlockingInternal(actor)) {
+		CancelPendingStop();
+		pluginRequestedBlocking = false;
+		_MESSAGE("Block ownership handed off to the game's blocking request");
+		return;
+	}
+
+	// The graph has caught up with a previous blockStop request.
+	if (!isBlocking) {
+		blockStopFalseFrameCount++;
+		if (blockStopFalseFrameCount >= blockStopConfirmFrames) {
+			CancelPendingStop();
+			pluginRequestedBlocking = false;
+			_MESSAGE("Block stop confirmed by stable IsBlocking=0");
+		}
+		return;
+	}
+	blockStopFalseFrameCount = 0;
+
+	// Animation events can be rejected while menus or graph transitions are active.
+	// Keep the request pending and retry after the existing cooldown.
+	if (IsInMenuMode(nullptr, 0) || lastBlockStopFrameCount > 0) return;
+
+	StopBlocking(actor);
+	blockStopRetryCount++;
+
+	// Keep eventual reconciliation without sending blockStop twice per second forever
+	// when an animation graph remains latched. Back off to at most one retry every
+	// four seconds after the first few attempts.
+	lastBlockStopFrameCount = GetBlockStopRetryCooldown();
+}
+
+void ResetBlockingStateTracking()
+{
+	pluginRequestedBlocking = false;
+	blockStopPending = false;
+	postLoadReconcilePending = false;
+	blockStopRetryCount = 0;
+	blockStopFalseFrameCount = 0;
+	postLoadReconcileDelayFrameCount = 0;
+	postLoadGraphFalseFrameCount = 0;
+	lastBlockStartFrameCount = 0;
+	lastBlockStopFrameCount = 0;
+
+	for (int i = 0; i < numPrevIsBlocking; i++) {
+		prevIsBlockings[i] = false;
+	}
 }
 
 bool WaitPosesCB(vr_src::TrackedDevicePose_t *pRenderPoseArray, uint32_t unRenderPoseArrayCount, vr_src::TrackedDevicePose_t *pGamePoseArray, uint32_t unGamePoseArrayCount)
@@ -270,34 +385,117 @@ void Update()
 		lastBlockStopFrameCount--;
 
 	PlayerCharacter *player = *g_thePlayer;
-	if (!player || !player->GetNiNode() || !player->actorState.IsWeaponDrawn()) return;
+	if (!player) return;
 
-	if (IsInMenuMode(nullptr, 0)) return;
+	bool graphIsBlocking = false;
+	const bool graphReady = TryGetIsBlocking(player, graphIsBlocking);
+
+	// Saved animation variables can survive a load while this plugin's transient globals do not.
+	// Reconcile a stale block once the graph is available. Do not cancel a genuine vanilla block.
+	if (postLoadReconcilePending && graphReady) {
+		if (!graphIsBlocking) {
+			postLoadGraphFalseFrameCount++;
+			if (postLoadGraphFalseFrameCount >= blockStopConfirmFrames) {
+				postLoadReconcilePending = false;
+				postLoadReconcileDelayFrameCount = 0;
+				postLoadGraphFalseFrameCount = 0;
+			}
+		}
+		else {
+			postLoadGraphFalseFrameCount = 0;
+		}
+
+		if (graphIsBlocking && IsBlockingInternal(player)) {
+			// A genuine block can legitimately be restored from a save. Keep watching until it
+			// clears normally; only repair if wantBlocking later remains false for the full delay.
+			postLoadReconcileDelayFrameCount = postLoadReconcileDelayFrames;
+		}
+		else if (graphIsBlocking && postLoadReconcileDelayFrameCount > 0) {
+			postLoadReconcileDelayFrameCount--;
+		}
+		else if (graphIsBlocking && lastBlockStopFrameCount <= 0) {
+			pluginRequestedBlocking = true;
+			RequestStopBlocking();
+
+			// Runtime testing confirmed that blockStop can be accepted without clearing the
+			// saved graph variable. Keep the direct write limited to the proven post-load
+			// mismatch; normal live cleanup remains animation-event driven.
+			const bool blockStopAccepted = StopBlocking(player);
+			const bool graphClearAccepted = TrySetIsBlocking(player, false);
+			blockStopRetryCount++;
+			lastBlockStopFrameCount = GetBlockStopRetryCooldown();
+
+			bool afterIsBlocking = true;
+			const bool verificationReadable = TryGetIsBlocking(player, afterIsBlocking);
+			_WARNING(
+				"Loaded stale IsBlocking repair: wantBlocking=0, blockStopAccepted=%d, "
+				"graphClearAccepted=%d, verificationReadable=%d, afterIsBlocking=%d",
+				blockStopAccepted, graphClearAccepted, verificationReadable, afterIsBlocking);
+
+			if (verificationReadable && !afterIsBlocking) {
+				postLoadReconcilePending = false;
+				postLoadReconcileDelayFrameCount = 0;
+				postLoadGraphFalseFrameCount = 0;
+				CancelPendingStop();
+				pluginRequestedBlocking = false;
+				graphIsBlocking = false;
+				_WARNING("Loaded stale IsBlocking state repaired successfully");
+			}
+		}
+	}
+
+	if (!postLoadReconcilePending && pluginRequestedBlocking && IsBlockingInternal(player)) {
+		CancelPendingStop();
+		pluginRequestedBlocking = false;
+		_MESSAGE("Block ownership handed off to the game's blocking request");
+	}
+
+	if (!player->GetNiNode() || !player->actorState.IsWeaponDrawn()) {
+		RequestStopBlocking();
+		ProcessPendingStop(player, graphReady, graphIsBlocking);
+		return;
+	}
+
+	if (IsInMenuMode(nullptr, 0)) {
+		RequestStopBlocking();
+		ProcessPendingStop(player, graphReady, graphIsBlocking);
+		return;
+	}
 
 	NiPointer<NiAVObject> hmdNode = player->unk3F0[PlayerCharacter::Node::kNode_HmdNode];
-	if (!hmdNode) return;
+	if (!hmdNode) {
+		RequestStopBlocking();
+		ProcessPendingStop(player, graphReady, graphIsBlocking);
+		return;
+	}
 
 	NiPointer<NiAVObject> rightWand = player->unk3F0[PlayerCharacter::Node::kNode_RightWandNode];
-	if (!rightWand) return;
+	if (!rightWand) {
+		RequestStopBlocking();
+		ProcessPendingStop(player, graphReady, graphIsBlocking);
+		return;
+	}
 
 	NiPointer<NiAVObject> leftWand = player->unk3F0[PlayerCharacter::Node::kNode_LeftWandNode];
-	if (!leftWand) return;
-
-	bool wasLastUpdateValid = isLastUpdateValid;
-	isLastUpdateValid = false;
+	if (!leftWand) {
+		RequestStopBlocking();
+		ProcessPendingStop(player, graphReady, graphIsBlocking);
+		return;
+	}
 
 	TESForm *mainHandItem = GetMainHandObject(player);
 	TESForm *offHandItem = GetOffHandObject(player);
 	if(!IsDualWielding(mainHandItem, offHandItem)) {
-		// If we switched weapons away from dual wielding, cancel existing block state
-		if (wasLastUpdateValid) {
-			StopBlocking(player);
-		}
+		// If we switched weapons away from dual wielding, cancel any block state this plugin initiated.
+		RequestStopBlocking();
+		ProcessPendingStop(player, graphReady, graphIsBlocking);
 		return;
 	}
 
-	// Check if the player is blocking
-	bool isBlocking = GetIsBlockingMode();
+	// Check if the player is blocking. A temporarily unavailable graph must not feed an
+	// uninitialised bool into the five-frame mode calculation.
+	bool isBlocking = false;
+	if (!GetIsBlockingMode(isBlocking)) return;
 
 	bool isLeftHanded = *g_leftHandedMode;
 
@@ -336,20 +534,27 @@ void Update()
 	}
 
 	if (mainHandBlockStatus == 2 || offHandBlockStatus == 2) { // Either hand is in blocking position
-		if (lastBlockStartFrameCount <= 0) { // Do not try to block more than once every n updates
+		// The user returned to a blocking pose before a pending stop completed.
+		// Preserve the current block instead of continuing to stop it.
+		if (!postLoadReconcilePending) {
+			CancelPendingStop();
+		}
+
+		if (!postLoadReconcilePending && !isBlocking && lastBlockStartFrameCount <= 0) { // Do not try to block more than once every n updates
 			// Start blocking
 			StartBlocking(player);
+			// Preserve the original cooldown even when the graph rejects the event.
 			lastBlockStartFrameCount = blockCooldown;
 		}
 	}
 	else if (mainHandBlockStatus == 1 && offHandBlockStatus == 1) { // Both hands are not blocking
-		if (lastBlockStopFrameCount <= 0) { // Do not try to block more than once every n updates
-			// Stop blocking
-			StopBlocking(player);
-			lastBlockStopFrameCount = blockCooldown;
-		}
+		RequestStopBlocking();
+		ProcessPendingStop(player, true, isBlocking);
 	}
-	isLastUpdateValid = true;
+	else {
+		// Continue an earlier stop while the hands are between the enter/exit thresholds.
+		ProcessPendingStop(player, true, isBlocking);
+	}
 }
 
 
@@ -358,8 +563,12 @@ void OnSKSEMessage(SKSEMessagingInterface::Message* msg)
 {
 	if (msg) {
 		if (msg->type == SKSEMessagingInterface::kMessage_PreLoadGame) {
+			ResetBlockingStateTracking();
 		}
 		else if (msg->type == SKSEMessagingInterface::kMessage_PostLoadGame || msg->type == SKSEMessagingInterface::kMessage_NewGame) {
+			ResetBlockingStateTracking();
+			postLoadReconcilePending = true;
+			postLoadReconcileDelayFrameCount = postLoadReconcileDelayFrames;
 		}
 		else if (msg->type == SKSEMessagingInterface::kMessage_DataLoaded) {
 			*g_fMeleeLinearVelocityThreshold_Blocking = g_vanillaBlockingVelocityOverride;
@@ -479,9 +688,7 @@ extern "C" {
 			_WARNING("[WARNING] Failed to read config options. Using defaults instead.");
 		}
 
-		for (int i = 0; i < numPrevIsBlocking; i++) {
-			prevIsBlockings[i] = false;
-		}
+		ResetBlockingStateTracking();
 
 		g_original_PlayerCharacter_UpdateRefLight = *PlayerCharacter_UpdateRefLight_vtbl;
 		SafeWrite64(PlayerCharacter_UpdateRefLight_vtbl.GetUIntPtr(), uintptr_t(PlayerCharacter_UpdateRefLight_Hook));
